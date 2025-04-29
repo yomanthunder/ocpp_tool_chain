@@ -5,6 +5,7 @@ from ocpp.routing import on
 from ocpp.v201 import ChargePoint as cp
 from ocpp.v201 import call_result
 from ocpp.v201.enums import Action
+import websockets
 import serial
 import json
 
@@ -33,7 +34,7 @@ def get_energy_cost_from_tms(current, final):
             # Example response: { "energy_used": 1.2 }
             energy_used = response.get("energy_used", 0)
             total_cost = energy_used * COST_PER_KWH
-            time_op = 0 #subtyract time before and after execution 
+            time_op = 0 #subtyract time before and after
             return total_cost, energy_used,time_op
 
     except Exception as e:
