@@ -1,52 +1,85 @@
 import asyncio
 import logging
-import websockets
+from datetime import datetime,timezone
+try:
+    import websockets
+except ModuleNotFoundError:
+    print("This example relies on the 'websockets' package.")
+    print("Please install it by running: ")
+    print()
+    print(" $ pip install websockets")
+    import sys
 
-from ocpp.v201 import call
+    sys.exit(1)
+
+
 from ocpp.v201 import ChargePoint as cp
-from ocpp.v201.enums import RegistrationStatusEnumType, TriggerReasonEnumType, TransactionEventEnumType
+from ocpp.v201 import call
+from ocpp.v201 import call_result
 
 logging.basicConfig(level=logging.INFO)
 
+
 class ChargePoint(cp):
+    async def send_heartbeat(self, interval):
+        request = call.Heartbeat()
+        while True:
+            await self.call(request)
+            await asyncio.sleep(interval)
+
     async def send_boot_notification(self):
-        """ Send BootNotification to the CSMS """
         request = call.BootNotification(
-            charging_station={"model": "Server_based_Cp", "vendor_name": "Shrishvesh"},
-            reason="PowerUp"
+            charging_station={"model": "scorpio26", "vendor_name": "shrishvesh"},
+            reason="PowerUp",
         )
-
         response = await self.call(request)
 
-        if response.status == RegistrationStatusEnumType.accepted:
-            logging.info("Connected to central system.")
-
-    async def start_transaction(self):
-        """ Start a transaction and send TransactionEvent to the CSMS """
+        if response.status == "Accepted":
+            print("Connected to central system.")
+            await self.send_heartbeat(response.interval)
+            
+            
+    async def send_start_transaction(self):
+        current_time = datetime.now(timezone.utc).isoformat()
         request = call.TransactionEvent(
-            event_type=TransactionEventEnumType.started,  # Correct enum
-            timestamp="2025-03-26T06:44:25.863656+00:00",
-            transaction_info={"transaction_id": "1234"},
-            trigger_reason=TriggerReasonEnumType.power_up,  # Required field
-            seq_no=1  # ✅ Required field
+            event_type="Started",
+            timestamp=current_time,  # current UTC time
+            trigger_reason="Authorized",
+            seq_no=1,
+            evse={"id": 1, "connector_id": 1},
+            id_token={"id_token": "abc123", "type": "Central"},
+            meter_value=[{
+                "timestamp": current_time,
+                "sampled_value": [{"value": 0, "measurand": "Energy.Active.Import.Register"}]
+            }],
+            transaction_info={
+                "transaction_id": "tx12345",
+                "charging_state": "Charging",   # assuming ChargingStateEnumType.Charging
+                "time_spent_charging": 0,
+                "stopped_reason": None,
+                "remote_start_id": None
+            },
+            custom_data={
+            "vendorId": "shrishvesh_vendor",  # Add the required vendorId here
+            "current_charging": 0,
+            "final_charging": 0
+            }
+            
         )
         response = await self.call(request)
-        logging.info(f"Transaction started: {response}")
-
-    async def start_operations(self):
-        """ Start the boot notification and then handle transactions """
-        await self.send_boot_notification()
-        await asyncio.sleep(2)  # Ensure CSMS has time to process BootNotification
-        await self.start_transaction()
+        logging.info(f"TransactionEvent response received: {response}")
 
 async def main():
     async with websockets.connect(
-            'ws://localhost:9000/default',  # Using "/default" as the path
-            subprotocols=['ocpp2.0.1']  # Correct subprotocol
+        "ws://localhost:9000/CP_1", subprotocols=["ocpp2.0.1"]
     ) as ws:
-        cp = ChargePoint('CP_1', ws)
-        await cp.start_operations()  # Ensure boot notification & transaction are sent
-        await cp.start()  # Keep connection open for further interactions
 
-if __name__ == '__main__':
+        charge_point = ChargePoint("CP_1", ws)
+        await asyncio.gather(
+            charge_point.start(), charge_point.send_boot_notification()
+        )
+
+
+if __name__ == "__main__":
+    # asyncio.run() is used when running this example with Python >= 3.7v
     asyncio.run(main())

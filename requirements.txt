@@ -1,0 +1,5 @@
+flask
+ocpp
+websockets
+requests
+pyserial

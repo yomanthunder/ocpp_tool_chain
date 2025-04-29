@@ -1,121 +1,129 @@
 import asyncio
 import logging
-import websockets
 from datetime import datetime, timezone
-
 from ocpp.routing import on
 from ocpp.v201 import ChargePoint as cp
-from ocpp.v201 import call, call_result
-from ocpp.v201.enums import (
-    RegistrationStatusEnumType, MessageTriggerEnumType, ReasonEnumType, 
-    TransactionEventEnumType, TriggerReasonEnumType
-)
+from ocpp.v201 import call_result
+from ocpp.v201.enums import Action
+import serial
+import json
 
+ 
 logging.basicConfig(level=logging.INFO)
 
+SERIAL_PORT = '/dev/ttyAMA)'  # Adjust based on your setup
+BAUD_RATE = 115200            # Or whatever you're using
+COST_PER_KWH = 5              # ₹ per kWh or adjust unit
+
+def get_energy_cost_from_tms(current, final):
+    try:
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2) as ser:
+            payload = {
+                "current_charge": current,
+                "final_charge": final
+            }
+            ser.write((json.dumps(payload) + '\n').encode())
+
+            # Wait for response from TMS
+            line = ser.readline().decode().strip()
+            if not line:
+                raise Exception("No response from TMS320")
+            
+            response = json.loads(line)
+            # Example response: { "energy_used": 1.2 }
+            energy_used = response.get("energy_used", 0)
+            total_cost = energy_used * COST_PER_KWH
+            time_op = 0 #subtyract time before and after execution 
+            return total_cost, energy_used,time_op
+
+    except Exception as e:
+        print(f"Serial communication error: {e}")
+        return 0, 0 
+
 class ChargePoint(cp):
-    @on('BootNotification')
-    async def on_boot_notification(self, charging_station, reason, **kwargs):
-        logging.info(f"BootNotification received: {charging_station}, Reason: {reason}")
+    @on(Action.boot_notification)
+    def on_boot_notification(self, charging_station, reason, **kwargs):
         return call_result.BootNotification(
-            current_time=datetime.now(timezone.utc).isoformat(),
-            interval=10,
-            status=RegistrationStatusEnumType.accepted
+            current_time=datetime.now(timezone.utc).isoformat(), interval=10, status="Accepted"
         )
+
+    @on(Action.heartbeat)
+    def on_heartbeat(self):
+        print("Got a Heartbeat!")
+        return call_result.Heartbeat(
+            current_time=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        )
+    @on(Action.transaction_event)
+    async def on_start_transaction(self, **kwargs):
+        print("Received TransactionEvent from charge point!")
+
+        # Log important details
+        print(f"TransactionEvent type: {kwargs}")
+        # print(f"EVSE ID: {event.evse['id']}")
+        # print(f"Connector ID: {event.evse['connector_id']}")
+        # print(f"ID Token: {event.id_token['id_token']}")
+
+        # You can store this information in a database if you want.
+
+        # Now respond back to the charge point
+        response = call_result.TransactionEvent(
+            total_cost=0,
+            charging_priority=0,
+            id_token_info={"status": "Accepted"},
+            updated_personal_message=None
+        )
+        return response
     
-    async def send_heartbeat(self):
-        """Send a periodic heartbeat."""
-        while True:
-            await asyncio.sleep(5)  # Send heartbeat every 5s
-            request = call.Heartbeat()
-            response = await self.call(request)
-            logging.info(f"Heartbeat Response: {response.current_time}")
-
-    async def start_transaction(self):
-        """Start a simulated charging transaction."""
-        logging.info("Starting Charging Transaction...")
-
-        transaction_id = "TX123456"  # Fake Transaction ID
-        request = call.TransactionEvent(
-            event_type=TransactionEventEnumType.started,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            transaction_info={"transaction_id": transaction_id},
-            trigger_reason=TriggerReasonEnumType.power_up,  #  Required field
-            seq_no=1  # Required field
+    
+async def on_connect(websocket):
+    """For every new charge point that connects, create a ChargePoint
+    instance and start listening for messages.
+    """
+    try:
+        requested_protocols = websocket.request.headers["Sec-WebSocket-Protocol"]
+    except KeyError:
+        logging.error("Client hasn't requested any Subprotocol. Closing Connection")
+        return await websocket.close()
+    if websocket.subprotocol:
+        logging.info("Protocols Matched: %s", websocket.subprotocol)
+    else:
+        # In the websockets lib if no subprotocols are supported by the
+        # client and the server, it proceeds without a subprotocol,
+        # so we have to manually close the connection.
+        logging.warning(
+            "Protocols Mismatched | Expected Subprotocols: %s,"
+            " but client supports %s | Closing connection",
+            websocket.available_subprotocols,
+            requested_protocols,
         )
-        response = await self.call(request)
-        logging.info(f"Transaction Started: {response}")
-
-        # Send periodic meter values
-        await self.send_meter_values(transaction_id)
-
-        # Stop transaction after 10 seconds
-        await asyncio.sleep(10)
-        await self.stop_transaction(transaction_id)
-
-    async def send_meter_values(self, transaction_id):
-        """Send fake meter readings."""
-        meter_value = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sampled_value": [{"value": "15.3", "unit": "kWh"}]  # Fake energy reading
-        }
-
-        request = call.MeterValuesRequest(
-            transaction_id=transaction_id,
-            meter_value=[meter_value]
-        )
-        response = await self.call(request)
-        logging.info(f"Meter Values Sent: {response}")
-
-    async def stop_transaction(self, transaction_id):
-        """Stop a charging transaction."""
-        logging.info("Stopping Charging Transaction...")
-
-        request = call.TransactionEvent(
-            event_type=TransactionEventEnumType.ended,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            transaction_info={"transaction_id": transaction_id},
-            trigger_reason=TriggerReasonEnumType.ev_stop,  #  Required field
-            reason=ReasonEnumType.ev_disconnected,
-            seq_no=2  # Required field
-        )
-        response = await self.call(request)
-        logging.info(f"Transaction Stopped: {response}")
-
-
-async def on_connect(websocket, path="/default"):
-    logging.info(f"New connection attempt on path: {path}")
-
-    if websocket.subprotocol != "ocpp2.0.1":
-        logging.warning(f"Protocol mismatch. Expected: 'ocpp2.0.1', but got: '{websocket.subprotocol}'. Closing connection.")
         return await websocket.close()
 
-    charge_point_id = path.strip('/') if path else "default"
-    logging.info(f"Charge Point ID: {charge_point_id}")
+    charge_point_id = websocket.request.path.strip("/")
+    charge_point = ChargePoint(charge_point_id, websocket)
 
-    cp = ChargePoint(charge_point_id, websocket)
-
+    # loss of websocket connection handled gracefully 
     try:
-        await cp.start()  # This listens for messages until the connection is closed
-    except websockets.exceptions.ConnectionClosed:
-        logging.info(f"Connection closed for Charge Point: {charge_point_id}")
+        logging.info(f"Charge point '{charge_point_id}' connected.")
+        await charge_point.start()
+    except websockets.exceptions.ConnectionClosed as e:
+        logging.warning(f"Connection to charge point '{charge_point_id}' closed: {e.code} - {e.reason}")
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+        logging.exception(f"Unexpected error with charge point '{charge_point_id}': {e}")
+    finally:
+        # Perform any cleanup here
+        logging.info(f"Charge point '{charge_point_id}' disconnected.")
 
-
-    # # Start background tasks
-    # asyncio.create_task(cp.send_heartbeat())
-    # asyncio.create_task(cp.start_transaction())
 
 async def main():
+    #  deepcode ignore BindToAllNetworkInterfaces: <Example Purposes>
     server = await websockets.serve(
-        on_connect,
-        "0.0.0.0",
-        9000,
-        subprotocols=["ocpp2.0.1"]
+        on_connect, "0.0.0.0", 9000, subprotocols=["ocpp2.0.1"]
     )
-    logging.info("WebSocket Server Started on ws://0.0.0.0:9000")
+
+    logging.info("Server Started listening to new connections...")
     await server.wait_closed()
 
+
 if __name__ == "__main__":
+    # asyncio.run() is used when running this example with Python >= 3.7v
     asyncio.run(main())
